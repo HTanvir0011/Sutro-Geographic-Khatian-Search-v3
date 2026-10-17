@@ -8,6 +8,8 @@ from unittest.mock import patch
 from contextlib import closing
 
 from PIL import Image
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
 import app
 import admin_panel
 
@@ -19,10 +21,11 @@ class AdminTests(unittest.TestCase):
         app.DB_FILE = Path(self.temp.name) / 'test.sqlite3'
         app.INSTANCE = Path(self.temp.name)
         (app.INSTANCE / 'uploads').mkdir()
+        (app.INSTANCE / 'deed_rewrites').mkdir()
         with closing(sqlite3.connect(self.original_db)) as src, closing(sqlite3.connect(app.DB_FILE)) as dst:
             src.backup(dst)
             for table in ('admin_account', 'admin_users', 'admin_login_failures', 'uploaded_khatians', 'record_controls',
-                          'complaints', 'complaint_documents', 'complaint_submission_limits'):
+                          'complaints', 'complaint_documents', 'complaint_submission_limits', 'deed_rewrites'):
                 dst.execute('DELETE FROM ' + table)
             dst.commit()
         self.client = app.app.test_client()
@@ -48,6 +51,14 @@ class AdminTests(unittest.TestCase):
     def image(self):
         output = io.BytesIO()
         Image.new('RGB', (300, 200), 'white').save(output, 'PNG')
+        output.seek(0)
+        return output
+
+    def pdf(self, text='মূল দলিলের লেখা'):
+        output = io.BytesIO()
+        document = canvas.Canvas(output, pagesize=A4)
+        document.drawString(50, 780, text)
+        document.save()
         output.seek(0)
         return output
 
@@ -82,6 +93,13 @@ class AdminTests(unittest.TestCase):
         self.assertEqual(changed.status_code, 200)
         self.assertEqual(other.get('/api/admin/records').status_code, 401)
 
+    def test_login_does_not_depend_on_stale_csrf_token(self):
+        self.login()
+        other = app.app.test_client()
+        response = other.post('/api/admin/login',
+                              json={'username': 'superadmin', 'password': 'Testing-password-123!'})
+        self.assertEqual(response.status_code, 200)
+
     def test_login_rate_limit(self):
         self.login()
         self.call('POST', '/api/admin/logout')
@@ -111,6 +129,53 @@ class AdminTests(unittest.TestCase):
         self.assertEqual(other.post('/api/admin/login',
                                     json={'username': 'editor1', 'password': 'Editor-password-123!'},
                                     headers={'X-CSRF-Token': token}).status_code, 401)
+
+    def test_admin_can_review_and_generate_private_bengali_deed_pdf(self):
+        self.login()
+        response = self.client.post('/api/admin/deed-rewrites',
+                                    data={'file': (self.pdf(), 'source.pdf')},
+                                    headers={'X-CSRF-Token': self.csrf})
+        self.assertEqual(response.status_code, 201)
+        rewrite = response.get_json()
+        self.assertEqual(rewrite['status'], 'draft')
+        with self.client.get(rewrite['original_url']) as original:
+            self.assertEqual(original.status_code, 200)
+        generated = self.call('PATCH', '/api/admin/deed-rewrites/' + rewrite['id'],
+                              {'text': 'এটি সংশোধিত বাংলা দলিলের লেখা।'})
+        self.assertEqual(generated.status_code, 200)
+        output = generated.get_json()['rewritten_url']
+        with self.client.get(output) as download:
+            self.assertEqual(download.status_code, 200)
+            self.assertEqual(download.mimetype, 'application/pdf')
+            self.assertIn(b'%PDF', download.data[:10])
+        self.assertEqual(self.client.get('/api/admin/deed-rewrites/unknown/original').status_code, 404)
+
+    def test_deed_rewrite_requires_pdf_and_admin_session(self):
+        self.assertEqual(self.client.post('/api/admin/deed-rewrites',
+                                          data={'file': (self.image(), 'scan.png')},
+                                          headers={'X-CSRF-Token': self.csrf}).status_code, 401)
+        self.login()
+        self.assertEqual(self.client.post('/api/admin/deed-rewrites',
+                                          data={'file': (self.image(), 'scan.png')},
+                                          headers={'X-CSRF-Token': self.csrf}).status_code, 400)
+        self.assertEqual(self.client.post('/api/admin/deed-rewrites',
+                                          data={'file': (io.BytesIO(b'not a pdf'), 'broken.pdf')},
+                                          headers={'X-CSRF-Token': self.csrf}).status_code, 400)
+
+    def test_low_quality_pdf_text_is_not_presented_as_transcription(self):
+        self.assertFalse(admin_panel.usable_bengali_text('Fat i = 1285 Cae DN NTE WTA'))
+        self.assertTrue(admin_panel.usable_bengali_text('এটি একটি বাংলা দলিলের লেখা এবং আরও কিছু বাংলা বাক্য আছে।'))
+
+    def test_configured_vision_ai_takes_priority_for_deed_text(self):
+        self.login()
+        with patch.dict('os.environ', {'SUTRO_AI_API_KEY': 'test-key'}), \
+             patch('admin_panel.extract_deed_text',
+                   return_value=('সরাসরি বাংলা দলিলের লেখা।', 'Vision AI transcription: admin review required.', 1)):
+            response = self.client.post('/api/admin/deed-rewrites',
+                                        data={'file': (self.pdf('বাংলা text layer'), 'source.pdf')},
+                                        headers={'X-CSRF-Token': self.csrf})
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.get_json()['text'], 'সরাসরি বাংলা দলিলের লেখা।')
 
     def test_upload_review_publish_warning_delete_restore(self):
         self.login()

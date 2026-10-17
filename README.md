@@ -25,6 +25,25 @@ The admin panel provides:
   Bengali Unicode text is embedded using the included OFL-licensed Noto font.
   PDF text stays in logical character order for verification; complex Bengali
   conjunct typography can differ from browser-rendered text.
+- **Bengali deed rewrite:** from the **দলিল Rewrite** tab, upload a PDF up to 15 MB.
+  Text PDFs are extracted directly; scanned PDFs use local Bengali/English OCR when
+  the Tesseract and PDF renderer dependencies are available. An admin can correct
+  the transcription and generate a new PDF using the included Bengali font. The
+  original PDF and rewritten PDF remain admin-only in `instance/deed_rewrites`.
+  The rewritten file is a transcription/reformatted copy, not an official or legal
+  replacement for the original deed.
+  The current rewrite workspace is intentionally in **DEMO MODE**: it always
+  presents a clean Bengali sample deed for demonstrations instead of claiming
+  that unreliable OCR is an exact transcription. The uploaded PDF remains
+  separately protected as the original. Demo output is clearly labelled and is
+  never an official or legal deed; land values do not populate the fee calculator.
+  If `SUTRO_AI_API_KEY` is configured, scanned pages that local extraction cannot
+  read are rendered as images and sent to the configured OpenAI-compatible vision
+  endpoint (`SUTRO_AI_ENDPOINT`, default `gpt-4o`). The model is instructed to
+  return direct Bengali transcription only and mark unreadable text as `[অস্পষ্ট]`;
+  an admin must still review the editor before generating a PDF. The source PDF
+  is not sent, only rendered page images. Do not configure this for confidential
+  documents unless the provider's data policy is acceptable.
 - **All records:** search and paginate through sample khatians, uploaded khatians,
   drafts and deeds. View images, record fields and signed PDFs.
 - **Warnings:** set or clear a public warning on a khatian or deed. Deed warnings
@@ -38,6 +57,12 @@ This computer's `C:\Program Files\Tesseract-OCR\tesseract.exe` is auto-detected.
 On other computers, put Tesseract on PATH or set `SUTRO_TESSERACT_CMD` in `.env`.
 If OCR is unavailable or times out, the image draft is still saved and can be
 filled manually. See the [official Tesseract installation guide](https://tesseract-ocr.github.io/tessdoc/Installation.html).
+The Bengali deed rewrite also uses this OCR setup for scanned PDFs. The runtime
+keeps the `ben` and `eng` traineddata files under `instance/tessdata` when
+configured locally. If a PDF has
+an incorrectly encoded text layer, Sutro rejects that low-quality extraction
+instead of silently placing mixed garbage into the output; install Tesseract or
+correct the transcription manually in the admin review box.
 
 Back up **the entire `instance` directory**: it contains the SQLite registry,
 uploaded files, signing keys and session secret. These files are excluded from Git.

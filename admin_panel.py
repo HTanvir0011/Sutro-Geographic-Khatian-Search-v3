@@ -11,12 +11,28 @@ import sqlite3
 import subprocess
 import time
 import uuid
+import base64
+import urllib.error
+import urllib.request
 from datetime import timedelta
 from pathlib import Path
 
+import pdfplumber
 from flask import Blueprint, abort, jsonify, render_template, request, send_file, session
-from PIL import Image, ImageOps, UnidentifiedImageError
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps, UnidentifiedImageError
+from pdfminer.pdfdocument import PDFPasswordIncorrect
+from pdfminer.pdfparser import PDFSyntaxError
+from pdfplumber.utils.exceptions import PdfminerException
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfgen import canvas
 from werkzeug.security import check_password_hash, generate_password_hash
+
+try:
+    import pypdfium2
+except ImportError:
+    pypdfium2 = None
 
 bp = Blueprint('admin', __name__)
 service = None
@@ -91,13 +107,30 @@ def public_custom(db):
     return result
 
 
-def ocr_image(path):
+def ocr_image(path, psm=6, preprocess=False):
     executable = (os.getenv('SUTRO_TESSERACT_CMD') or shutil.which('tesseract') or
                   (r'C:\Program Files\Tesseract-OCR\tesseract.exe' if os.name == 'nt' else ''))
     if not executable or not Path(executable).is_file():
         return '', 'OCR engine পাওয়া যায়নি। Tesseract install করুন অথবা তথ্য হাতে পূরণ করুন।'
+    tessdata = service.INSTANCE / 'tessdata'
+    if not (tessdata / 'ben.traineddata').is_file():
+        return '', 'বাংলা OCR model পাওয়া যায়নি। ben.traineddata install করুন।'
+    source = Path(path)
+    processed = None
     try:
-        result = subprocess.run([executable, str(path), 'stdout', '-l', 'ben+eng', '--psm', '6'],
+        if preprocess:
+            with Image.open(source) as image:
+                image = ImageOps.exif_transpose(image).convert('L')
+                image = ImageOps.autocontrast(image)
+                image = ImageEnhance.Contrast(image).enhance(1.35)
+                image = image.filter(ImageFilter.SHARPEN)
+                image = image.resize((image.width * 2, image.height * 2), Image.Resampling.LANCZOS)
+                processed = service.INSTANCE / 'deed_rewrites' / (uuid.uuid4().hex + '-ocr.png')
+                image.save(processed, 'PNG')
+            source = processed
+        command = [executable, str(source), 'stdout', '-l', 'ben+eng', '--psm', str(psm),
+                   '--tessdata-dir', str(tessdata)]
+        result = subprocess.run(command,
                                 capture_output=True, encoding='utf-8', errors='replace', timeout=60,
                                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
         if result.returncode:
@@ -106,6 +139,167 @@ def ocr_image(path):
         return text, '' if text else 'ছবি থেকে লেখা পাওয়া যায়নি। পরিষ্কার ছবি দিন অথবা তথ্য হাতে পূরণ করুন।'
     except (OSError, subprocess.TimeoutExpired):
         return '', 'OCR সময়ের মধ্যে শেষ হয়নি। তথ্য হাতে পূরণ করা যাবে।'
+    finally:
+        if processed:
+            processed.unlink(missing_ok=True)
+
+
+def usable_bengali_text(text):
+    letters = re.findall(r'[A-Za-z\u0980-\u09FF]', text or '')
+    bengali = re.findall(r'[\u0980-\u09FF]', text or '')
+    if len(letters) < 20:
+        return len(bengali) >= 8
+    return len(bengali) >= 12 and len(bengali) / len(letters) >= 0.35
+
+
+def ai_deed_text(images):
+    api_key = os.getenv('SUTRO_AI_API_KEY', '').strip()
+    endpoint = os.getenv('SUTRO_AI_ENDPOINT', 'https://api.openai.com/v1/chat/completions').strip()
+    model = os.getenv('SUTRO_AI_MODEL', 'gpt-4o').strip()
+    if not api_key:
+        return '', 'বাংলা vision AI চালু নেই। .env-এ SUTRO_AI_API_KEY সেট করুন।'
+    content = [{
+        'type': 'text',
+        'text': (
+            'এই ছবিগুলো একটি বাংলা জমির দলিলের পৃষ্ঠা। ছবির দৃশ্যমান লেখা হুবহু '
+            'বাংলা অক্ষরে টাইপ করে দিন। কোনো তথ্য অনুমান, সংশোধন বা বানাবেন না। '
+            'পড়তে না পারলে [অস্পষ্ট] লিখুন। পৃষ্ঠা অনুযায়ী ধারাবাহিক plain text দিন; '
+            'কোনো ব্যাখ্যা, সারাংশ, legal opinion বা markdown দেবেন না।'
+        )
+    }]
+    for image in images:
+        encoded = base64.b64encode(image).decode('ascii')
+        content.append({'type': 'image_url', 'image_url': {
+            'url': 'data:image/png;base64,' + encoded, 'detail': 'high'
+        }})
+    payload = json.dumps({
+        'model': model,
+        'temperature': 0,
+        'messages': [{'role': 'user', 'content': content}]
+    }).encode('utf-8')
+    request = urllib.request.Request(endpoint, data=payload, method='POST',
+                                     headers={'Authorization': 'Bearer ' + api_key,
+                                              'Content-Type': 'application/json'})
+    try:
+        with urllib.request.urlopen(request, timeout=180) as response:
+            result = json.loads(response.read().decode('utf-8'))
+        value = result['choices'][0]['message']['content']
+        if isinstance(value, list):
+            value = ''.join(part.get('text', '') for part in value if isinstance(part, dict))
+        value = str(value).strip()[:200000]
+        if not usable_bengali_text(value):
+            return '', 'Vision AI বাংলা transcription দেয়নি। পৃষ্ঠাগুলো পরিষ্কার কি না যাচাই করুন।'
+        return value, ''
+    except (OSError, urllib.error.URLError, json.JSONDecodeError, KeyError, IndexError, TypeError):
+        return '', 'Vision AI transcription ব্যর্থ হয়েছে। পরে আবার চেষ্টা করুন অথবা হাতে সংশোধন করুন।'
+
+
+def extract_deed_text(raw):
+    try:
+        with pdfplumber.open(io.BytesIO(raw)) as pdf:
+            text = '\n\n'.join((page.extract_text() or '').strip() for page in pdf.pages).strip()
+            page_count = len(pdf.pages)
+    except (OSError, ValueError, PDFPasswordIncorrect, PDFSyntaxError, PdfminerException):
+        raise ValueError('PDF ফাইলটি পড়া যায়নি বা password-protected।')
+    if usable_bengali_text(text) and not os.getenv('SUTRO_AI_API_KEY', '').strip():
+        return text[:200000], '', page_count
+    if pypdfium2 is None:
+        return '', 'স্ক্যান করা PDF-এর OCR করার জন্য PDF renderer পাওয়া যায়নি।', page_count
+    parts = []
+    document = pypdfium2.PdfDocument(raw)
+    try:
+        for index, page in enumerate(document):
+            if index >= 20:
+                break
+            image = page.render(scale=3.5).to_pil()
+            temp_path = service.INSTANCE / 'deed_rewrites' / (uuid.uuid4().hex + '.png')
+            try:
+                image.save(temp_path, 'PNG')
+                candidates = []
+                for psm in (6, 11):
+                    page_text, _ = ocr_image(temp_path, psm=psm, preprocess=True)
+                    if page_text:
+                        candidates.append(page_text)
+                if candidates:
+                    parts.append(max(candidates, key=lambda value: (
+                        len(re.findall(r'[\u0980-\u09FF]', value)), len(value))))
+            finally:
+                temp_path.unlink(missing_ok=True)
+    finally:
+        document.close()
+    text = '\n\n'.join(parts).strip()[:200000]
+    if text and usable_bengali_text(text):
+        return text, '', page_count
+    if pypdfium2 is not None:
+        images = []
+        document = pypdfium2.PdfDocument(raw)
+        try:
+            max_pages = int(os.getenv('SUTRO_AI_MAX_PAGES', '20') or '20')
+            for index, page in enumerate(document):
+                if index >= max(1, min(max_pages, 20)):
+                    break
+                image_buffer = io.BytesIO()
+                page.render(scale=2.5).to_pil().convert('RGB').save(image_buffer, 'PNG')
+                images.append(image_buffer.getvalue())
+        finally:
+            document.close()
+        ai_text, ai_message = ai_deed_text(images)
+        if ai_text:
+            return ai_text, 'Vision AI transcription: admin review required.', page_count
+        if ai_message and os.getenv('SUTRO_AI_API_KEY'):
+            return '', ai_message, page_count
+    if text:
+        return '', ('PDF-এর লেখা সঠিকভাবে পড়া যায়নি। Tesseract OCR চালু করে '
+                    'আবার আপলোড করুন অথবা লেখা হাতে লিখে সংশোধন করুন।'), page_count
+    return '', ('স্ক্যান করা PDF-এর বাংলা OCR পাওয়া যায়নি। Tesseract OCR install করে '
+                'আবার আপলোড করুন অথবা লেখা হাতে লিখে সংশোধন করুন।'), page_count
+
+
+def rewritten_deed_pdf(text):
+    font_name = 'SutroRewriteBangla'
+    if font_name not in pdfmetrics.getRegisteredFontNames():
+        pdfmetrics.registerFont(TTFont(font_name, str(service.ROOT / 'static/fonts/NotoSansBengali-Regular.ttf')))
+    output = io.BytesIO()
+    document = canvas.Canvas(output, pagesize=A4)
+    width, height = A4
+    left, top, bottom = 48, height - 54, 48
+    document.setTitle('Sutro Bengali deed transcription')
+    document.setAuthor('Sutro admin workspace')
+    document.setFont(font_name, 16)
+    document.setFillColorRGB(0.05, 0.35, 0.24)
+    document.drawString(left, top, 'দলিলের বাংলা পুনর্লিখিত অনুলিপি')
+    document.setFont(font_name, 9)
+    document.setFillColorRGB(0.35, 0.45, 0.39)
+    document.drawString(left, top - 22, 'এটি OCR ও প্রশাসনিক সম্পাদনার ভিত্তিতে তৈরি পুনর্লিখিত কপি; সরকারি বা আইনগত মূল দলিল নয়।')
+    y = top - 58
+    document.setStrokeColorRGB(0.75, 0.84, 0.78)
+    document.line(left, y + 15, width - left, y + 15)
+    document.setFont(font_name, 12)
+    document.setFillColorRGB(0.09, 0.24, 0.18)
+    for paragraph in text.splitlines():
+        words = paragraph.split()
+        line = ''
+        for word in words or ['']:
+            candidate = word if not line else line + ' ' + word
+            if line and pdfmetrics.stringWidth(candidate, font_name, 12) > width - 2 * left:
+                if y < bottom:
+                    document.showPage()
+                    document.setFont(font_name, 12)
+                    y = height - 54
+                document.drawString(left, y, line)
+                y -= 20
+                line = word
+            else:
+                line = candidate
+        if y < bottom:
+            document.showPage()
+            document.setFont(font_name, 12)
+            y = height - 54
+        document.drawString(left, y, line)
+        y -= 24
+    document.save()
+    output.seek(0)
+    return output
 
 
 def extract_fields(text):
@@ -182,7 +376,7 @@ def protect():
             return jsonify(error='Invalid JSON object.'), 400
         if request.endpoint not in {'admin.auth_state', 'admin.login', 'admin.setup'} and not authenticated():
             return jsonify(error='Admin login required.'), 401
-        if request.method != 'GET':
+        if request.method != 'GET' and request.endpoint != 'admin.login':
             expected = str(session.get('csrf', ''))
             if not expected or not hmac.compare_digest(expected, request.headers.get('X-CSRF-Token', '')):
                 return jsonify(error='Session token missing or expired. Reload the admin panel.'), 403
@@ -376,6 +570,97 @@ def upload():
                    image_url='/api/admin/khatians/' + record_id + '/image'), 201
 
 
+@bp.post('/api/admin/deed-rewrites')
+def upload_deed_rewrite():
+    file = request.files.get('file')
+    if not file or not (file.filename or '').lower().endswith('.pdf'):
+        return jsonify(error='শুধু PDF দলিল আপলোড করুন।'), 400
+    raw = file.read(15 * 1024 * 1024 + 1)
+    if len(raw) > 15 * 1024 * 1024:
+        return jsonify(error='PDF ১৫ MB এর মধ্যে হতে হবে।'), 400
+    rewrite_id = 'R' + uuid.uuid4().hex
+    try:
+        text, message, page_count = extract_deed_text(raw)
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    original_name = rewrite_id + '-original.pdf'
+    directory = service.INSTANCE / 'deed_rewrites'
+    directory.mkdir(exist_ok=True)
+    (directory / original_name).write_bytes(raw)
+    with service.conn() as db:
+        db.execute('INSERT INTO deed_rewrites '
+                   '(id,original_filename,original_path,text,status,page_count,created_at,updated_at) '
+                   'VALUES (?,?,?,?,?,?,?,?)',
+                   (rewrite_id, file.filename[:255], original_name, text, 'draft', page_count,
+                    service.now(), service.now()))
+    service.audit('deed_rewrite_uploaded', rewrite_id, {'ocr_available': bool(text), 'pages': page_count})
+    return jsonify(id=rewrite_id, filename=file.filename[:255], text=text, message=message,
+                   page_count=page_count, status='draft',
+                   original_url='/api/admin/deed-rewrites/' + rewrite_id + '/original'), 201
+
+
+@bp.get('/api/admin/deed-rewrites/<rewrite_id>')
+def deed_rewrite(rewrite_id):
+    with service.conn() as db:
+        row = db.execute('SELECT id,original_filename,text,status,page_count,created_at,updated_at '
+                         'FROM deed_rewrites WHERE id=?', (rewrite_id,)).fetchone()
+    if not row:
+        abort(404)
+    result = dict(row)
+    result['original_url'] = '/api/admin/deed-rewrites/' + rewrite_id + '/original'
+    if result['status'] == 'completed':
+        result['rewritten_url'] = '/api/admin/deed-rewrites/' + rewrite_id + '/rewritten'
+    return jsonify(result)
+
+
+@bp.patch('/api/admin/deed-rewrites/<rewrite_id>')
+def save_deed_rewrite(rewrite_id):
+    obj = request.get_json(silent=True) or {}
+    text = obj.get('text')
+    if not isinstance(text, str) or not text.strip() or len(text) > 200000:
+        return jsonify(error='বাংলা লেখা ১ থেকে ২,০০,০০০ অক্ষরের মধ্যে দিন।'), 400
+    rewritten_name = rewrite_id + '-rewritten.pdf'
+    rewritten_path = service.INSTANCE / 'deed_rewrites' / rewritten_name
+    rewritten_path.write_bytes(rewritten_deed_pdf(text.strip()).read())
+    with service.conn() as db:
+        row = db.execute('SELECT id FROM deed_rewrites WHERE id=?', (rewrite_id,)).fetchone()
+        if not row:
+            rewritten_path.unlink(missing_ok=True)
+            abort(404)
+        db.execute('UPDATE deed_rewrites SET text=?,status=?,rewritten_path=?,updated_at=? WHERE id=?',
+                   (text.strip(), 'completed', rewritten_name, service.now(), rewrite_id))
+    service.audit('deed_rewrite_generated', rewrite_id, {'characters': len(text.strip())})
+    return jsonify(ok=True, id=rewrite_id, status='completed',
+                   rewritten_url='/api/admin/deed-rewrites/' + rewrite_id + '/rewritten')
+
+
+@bp.get('/api/admin/deed-rewrites/<rewrite_id>/original')
+def deed_rewrite_original(rewrite_id):
+    with service.conn() as db:
+        row = db.execute('SELECT original_path FROM deed_rewrites WHERE id=?', (rewrite_id,)).fetchone()
+    if not row:
+        abort(404)
+    path = service.INSTANCE / 'deed_rewrites' / row['original_path']
+    if not path.is_file():
+        abort(404)
+    return send_file(path, mimetype='application/pdf', as_attachment=False,
+                     download_name=rewrite_id + '-original.pdf')
+
+
+@bp.get('/api/admin/deed-rewrites/<rewrite_id>/rewritten')
+def deed_rewrite_output(rewrite_id):
+    with service.conn() as db:
+        row = db.execute('SELECT rewritten_path FROM deed_rewrites WHERE id=? AND status=?',
+                         (rewrite_id, 'completed')).fetchone()
+    if not row:
+        abort(404)
+    path = service.INSTANCE / 'deed_rewrites' / row['rewritten_path']
+    if not path.is_file():
+        abort(404)
+    return send_file(path, mimetype='application/pdf', as_attachment=True,
+                     download_name=rewrite_id + '-bangla.pdf')
+
+
 @bp.get('/api/admin/khatians/<record_id>/image')
 def preview_image(record_id):
     with service.conn() as db:
@@ -542,6 +827,7 @@ def register_admin(app, backend):
                       SESSION_COOKIE_SECURE=os.getenv('SUTRO_COOKIE_SECURE', '0') == '1',
                       PERMANENT_SESSION_LIFETIME=timedelta(hours=8))
     (service.INSTANCE / 'uploads').mkdir(exist_ok=True)
+    (service.INSTANCE / 'deed_rewrites').mkdir(exist_ok=True)
     with service.conn() as db:
         db.executescript('''
             CREATE TABLE IF NOT EXISTS admin_account(id INTEGER PRIMARY KEY CHECK(id=1),password_hash TEXT NOT NULL);
@@ -558,6 +844,11 @@ def register_admin(app, backend):
                 record_json TEXT NOT NULL,ocr_text TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,ocr_message TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS record_controls(kind TEXT,record_id TEXT,deleted INTEGER NOT NULL DEFAULT 0,
                 warning TEXT NOT NULL DEFAULT '',PRIMARY KEY(kind,record_id));
+            CREATE TABLE IF NOT EXISTS deed_rewrites(
+                id TEXT PRIMARY KEY,original_filename TEXT NOT NULL,original_path TEXT NOT NULL,
+                text TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('draft','completed')),
+                rewritten_path TEXT,page_count INTEGER NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL
+            );
         ''')
         configured = os.getenv('SUTRO_ADMIN_PASSWORD')
         if configured and not db.execute('SELECT 1 FROM admin_account WHERE id=1').fetchone():

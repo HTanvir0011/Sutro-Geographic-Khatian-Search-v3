@@ -9,13 +9,19 @@ async function api(url,options={}){
  const headers={...options.headers};
  if(options.method&&options.method!=='GET')headers['X-CSRF-Token']=csrf;
  if(options.body&&!(options.body instanceof FormData))headers['Content-Type']='application/json';
- const response=await fetch(url,{...options,headers});
+ const response=await fetch(url,{...options,headers,cache:'no-store'});
  let data;try{data=await response.json()}catch{throw Error('সার্ভার থেকে সঠিক উত্তর পাওয়া যায়নি।')}
+ if(response.status===403&&data.error==='Session token missing or expired. Reload the admin panel.'&&
+    options.method&&options.method!=='GET'&&!url.endsWith('/login')&&!url.endsWith('/setup')&&!options._csrfRetry){
+  const state=await fetch('/api/admin/session',{cache:'no-store'}).then(result=>result.json());
+  csrf=state.csrf;
+  return api(url,{...options,_csrfRetry:true});
+ }
  if(!response.ok){if(response.status===401&&!url.endsWith('/login')){adminActive=false;el('recordDialog').close();el('complaintDialog').close();el('workspace').hidden=true;el('loginView').hidden=false;el('logout').hidden=true}throw Error(data.error||'অনুরোধ সম্পন্ন হয়নি।')}
  return data;
 }
 async function busy(form,work){const buttons=[...form.querySelectorAll('button')].map(button=>({button,disabled:button.disabled}));buttons.forEach(({button})=>button.disabled=true);try{await work()}catch(error){message(error.message,true)}finally{buttons.forEach(({button,disabled})=>button.disabled=disabled)}}
-function tab(name){for(const item of ['records','upload','deed','evidence','settings','complaints'])el(item+'Panel').hidden=item!==name;document.querySelectorAll('[data-tab]').forEach(b=>b.classList.toggle('active',b.dataset.tab===name));if(name==='records')loadRecords();if(name==='settings'&&el('userManagement')&&!el('userManagement').hidden)loadAdminUsers();if(name==='complaints')loadComplaints();if(name==='evidence')loadEvidenceHistory()}
+function tab(name){for(const item of ['records','upload','deed','rewrite','evidence','settings','complaints'])el(item+'Panel').hidden=item!==name;document.querySelectorAll('[data-tab]').forEach(b=>b.classList.toggle('active',b.dataset.tab===name));if(name==='records')loadRecords();if(name==='settings'&&el('userManagement')&&!el('userManagement').hidden)loadAdminUsers();if(name==='complaints')loadComplaints();if(name==='evidence')loadEvidenceHistory()}
 async function loadSession(){
  const data=await api('/api/admin/session');csrf=data.csrf;setup=data.setup_required;
  adminActive=data.authenticated;
@@ -28,7 +34,7 @@ async function loadSession(){
  el('confirmLabel').hidden=!setup;el('confirmPassword').required=setup;
  el('password').minLength=setup?12:1;el('password').autocomplete=setup?'new-password':'current-password';
  const userManagement=el('userManagement');if(userManagement)userManagement.hidden=!data.authenticated||data.admin?.role!=='superadmin';
- if(data.authenticated){tab(['records','upload','deed','evidence','settings','complaints'].includes(location.hash.slice(1))?location.hash.slice(1):'records');loadPlaces();refreshComplaintBadge();if(data.admin?.role==='superadmin')loadAdminUsers()}
+ if(data.authenticated){tab(['records','upload','deed','rewrite','evidence','settings','complaints'].includes(location.hash.slice(1))?location.hash.slice(1):'records');loadPlaces();refreshComplaintBadge();if(data.admin?.role==='superadmin')loadAdminUsers()}
 }
 async function loadAdminUsers(){if(!el('adminUserList'))return;try{const data=await api('/api/admin/users');el('adminUserList').innerHTML=data.users.map(user=>`<div class="admin-user-row"><strong>${esc(user.username)}</strong><span>${esc(user.role)} · ${user.active?'Active':'Disabled'}</span>${user.role==='admin'?`<button type="button" data-admin-id="${user.id}" data-admin-active="${user.active?'0':'1'}">${user.active?'Disable':'Enable'}</button>`:''}</div>`).join('')}catch(error){message(error.message,true)}}
 async function loadRecords(){
@@ -77,7 +83,7 @@ async function loadMouzas(){
 }
 el('loginForm').addEventListener('submit',event=>{event.preventDefault();busy(event.target,async()=>{
  if(setup&&el('password').value!==el('confirmPassword').value)throw Error('দুটি পাসওয়ার্ড মেলেনি।');
- const username=el('username');const password=el('password');if(!password)throw Error('Admin login form is incomplete. Reload the page.');const data=await api('/api/admin/'+(setup?'setup':'login'),{method:'POST',body:JSON.stringify({username:username?username.value:'superadmin',password:password.value})});csrf=data.csrf;event.target.reset();await loadSession();
+ const username=el('username');const passwordInput=el('password');if(!passwordInput)throw Error('Admin login form is incomplete. Reload the page.');const data=await api('/api/admin/'+(setup?'setup':'login'),{method:'POST',body:JSON.stringify({username:username?username.value:'superadmin',password:passwordInput.value})});csrf=data.csrf;event.target.reset();await loadSession();
 })});
 el('logout').addEventListener('click',()=>busy(el('workspace'),async()=>{await api('/api/admin/logout',{method:'POST'});adminActive=false;complaintRequest++;complaintDetailRequest++;el('complaintDialog').close();el('complaintDetail').textContent='';el('complaintRows').textContent='';el('complaintNote').value='';currentComplaint=null;el('recordDialog').close();uploadId=null;el('reviewCard').hidden=true;el('reviewForm').reset();await loadSession()}));
 setupEvidence();
@@ -93,6 +99,131 @@ el('editUpload').addEventListener('click',()=>{el('recordDialog').close();fillRe
 el('uploadForm').addEventListener('submit',event=>{event.preventDefault();busy(event.target,async()=>{
  el('uploadStatus').textContent='ছবি আপলোড ও OCR চলছে…';
  try{const data=await api('/api/admin/khatian-upload',{method:'POST',body:new FormData(event.target)});fillReview(data);message('Draft তৈরি হয়েছে। তথ্য যাচাই করে Publish করুন।')}finally{el('uploadStatus').textContent=''}
+})});
+let rewriteId='';
+const sampleRewrites={
+ sale:{title:'নমুনা ১: সাফ-কবলা বিক্রয় দলিল',finding:'AI review suggestion: বিক্রেতা/ক্রেতা, বিক্রয়মূল্য, খতিয়ান-দাগ, জমির পরিমাণ ও চৌহদ্দি মিলিয়ে দেখুন। এটি legal conclusion নয়.',text:`নমুনা ১: সাফ-কবলা বিক্রয় দলিল
+দলিল নং: ১২৪৫/২০২৪ | সাব-রেজিস্ট্রি অফিস: সাভার, ঢাকা
+
+বিক্রেতা: মোঃ আব্দুল করিম, পিতা মৃত রহিম উদ্দিন, মাতা মোছাঃ আমেনা বেগম, জাতীয়তা বাংলাদেশী, পেশা ব্যবসা, ঠিকানা: গ্রাম আশুলিয়া, ডাকঘর আশুলিয়া, উপজেলা সাভার, জেলা ঢাকা।
+ক্রেতা: মোঃ মাহমুদুল হাসান, পিতা মোঃ আব্দুস সালাম, মাতা মোছাঃ রওশন আরা, জাতীয়তা বাংলাদেশী, পেশা চাকরি, ঠিকানা: গ্রাম বিরুলিয়া, ডাকঘর বিরুলিয়া, উপজেলা সাভার, জেলা ঢাকা।
+
+পরম করুণাময় আল্লাহ তায়ালার নাম স্মরণপূর্বক অত্র সাফ-কবলা দলিলের বিবরণ আরম্ভ করিলাম। আমি প্রথম পক্ষ বিক্রেতা এই মর্মে ঘোষণা করিতেছি যে, নিম্ন তফসিলে বর্ণিত সম্পত্তি আমার বৈধ মালিকানাধীন এবং দীর্ঘদিন যাবৎ আমার শান্তিপূর্ণ, প্রকাশ্য ও নিরবচ্ছিন্ন ভোগদখলে রহিয়াছে। উক্ত সম্পত্তি আমার পিতা মৃত রহিম উদ্দিনের নামে পূর্ববর্তী জরিপ রেকর্ডে অন্তর্ভুক্ত ছিল। তিনি জীবিত থাকা অবস্থায় নিয়মিত ভূমি উন্নয়ন কর পরিশোধ করিতেন এবং স্থানীয়ভাবে উক্ত জমির দখল ভোগ করিতেন।
+
+আমার পিতার মৃত্যুর পর তাহার রেখে যাওয়া সম্পত্তিতে আমি ও আমার অন্যান্য উত্তরাধিকারীগণ আইনানুগভাবে অংশীদার হই। পরবর্তীকালে সকল ওয়ারিশের সম্মতিতে পারিবারিক আপস-বণ্টন সম্পন্ন হয়। সেই আপস-বণ্টনের মাধ্যমে নিম্ন তফসিলে বর্ণিত ৫.০০ শতক জমি আমার অংশে নির্ধারিত হয়। সংশ্লিষ্ট ভূমি অফিসে প্রয়োজনীয় আবেদন দাখিলের পর আমার নামে নামজারি খতিয়ান নং ১৪৫ সৃজিত হয়। নামজারি হওয়ার পর হইতে আমি নিজে উক্ত জমির সীমানা রক্ষা, দখল সংরক্ষণ এবং ভূমি উন্নয়ন কর পরিশোধ করিয়া আসিতেছি।
+
+উক্ত জমির কোনো অংশ পূর্বে অন্য কোনো ব্যক্তির নিকট বিক্রয়, দান, হেবা, বন্ধক, বায়না, ইজারা বা অন্য কোনো প্রকারে হস্তান্তর করা হয় নাই। জমিটি কোনো দেওয়ানি বা ফৌজদারি মামলায় জব্দ নহে এবং আমার জানা মতে কোনো আদালত বা কর্তৃপক্ষের নিষেধাজ্ঞার অধীনও নহে। তবে ক্রেতাকে পরামর্শ দেওয়া হইল যে, রেজিস্ট্রির পূর্বে তিনি নিজ দায়িত্বে খতিয়ান, নামজারি, ভূমি উন্নয়ন করের দাখিলা, পূর্ববর্তী দলিল, নকশা, দখল ও সীমানা যাচাই করিয়া লইবেন।
+
+বর্তমানে পারিবারিক প্রয়োজন, ব্যবসায়িক দায় এবং আর্থিক সংকটের কারণে উক্ত জমি বিক্রয়ের সিদ্ধান্ত গ্রহণ করিয়াছি। দ্বিতীয় পক্ষ ক্রেতা মোঃ মাহমুদুল হাসান জমিটি সরেজমিনে পরিদর্শন করিয়াছেন। তিনি জমির অবস্থান, রাস্তা, চারদিকের সীমানা, মাটি, ব্যবহারযোগ্যতা এবং স্থানীয় দখল সম্পর্কে প্রশ্ন করিয়া সন্তুষ্ট হইয়াছেন। উভয় পক্ষের মধ্যে আলোচনার পর মোট বিক্রয়মূল্য ১২,৫০,০০০/- (বারো লক্ষ পঞ্চাশ হাজার) টাকা নির্ধারিত হইল।
+
+ক্রেতা আজকের তারিখে বিক্রেতাকে উক্ত সম্পূর্ণ বিক্রয়মূল্য নগদ ও ব্যাংক লেনদেনের সমন্বয়ে প্রদান করিলেন এবং বিক্রেতা সেই অর্থ সম্পূর্ণরূপে বুঝিয়া পাওয়ার কথা স্বীকার করিলেন। অর্থ গ্রহণের বিষয়ে ভবিষ্যতে কোনো দাবি থাকিলে তাহা যথাযথ লিখিত প্রমাণ ও আইনানুগ প্রক্রিয়ার মাধ্যমে উত্থাপন করিতে হইবে। বিক্রেতা মূল্য গ্রহণ করিয়া নিম্ন তফসিলে বর্ণিত সম্পত্তির যাবতীয় স্বত্ব, অধিকার, মালিকানা, দখল, ব্যবহার, উন্নয়ন এবং উত্তরাধিকারসূত্রে প্রাপ্ত দাবি ক্রেতার নিকট স্থায়ীভাবে হস্তান্তর করিলেন।
+
+অদ্য হইতে ক্রেতা উক্ত সম্পত্তিতে নিজ নামে নামজারি করিতে, ভূমি উন্নয়ন কর প্রদান করিতে, ঘর বা স্থাপনা নির্মাণ করিতে, কৃষিকাজ করিতে, সীমানা নির্ধারণ করিতে এবং আইনানুগভাবে ভোগদখল করিতে পারিবেন। ক্রেতা প্রয়োজনীয় অনুমতি সাপেক্ষে উক্ত সম্পত্তি পুনরায় বিক্রয়, দান, হেবা, বন্ধক বা অন্য কোনো আইনানুগ উপায়ে হস্তান্তর করিতে পারিবেন। বিক্রেতা বা বিক্রেতার কোনো উত্তরাধিকারী ভবিষ্যতে উক্ত সম্পত্তির উপর কোনো মালিকানা, দখল, অংশ বা অতিরিক্ত মূল্য দাবি করিবেন না।
+
+বিক্রেতা আরও ঘোষণা করিতেছেন যে, সম্পত্তির পূর্ববর্তী মালিকানা সংক্রান্ত সকল তথ্য যতদূর তাহার জ্ঞাত, সঠিকভাবে ক্রেতাকে জানানো হইয়াছে। যদি কোনো পূর্ববর্তী গোপন লেনদেন, উত্তরাধিকার দাবি, বন্ধক, নিষেধাজ্ঞা বা তৃতীয় পক্ষের স্বত্ব বিক্রেতার পূর্ববর্তী কার্যকলাপের কারণে প্রকাশ পায়, তবে সেই দাবি নিষ্পত্তির আইনানুগ দায় বিক্রেতা বহন করিবেন। ক্রেতা বর্তমান দলিলের ভিত্তিতে নামজারি ও দখল গ্রহণের সময় স্থানীয় ভূমি অফিস এবং সংশ্লিষ্ট কর্তৃপক্ষের নিয়ম পালন করিবেন।
+
+সম্পত্তির তফসিল: জেলা ঢাকা, উপজেলা সাভার, মৌজা আশুলিয়া, জে.এল. নং ২৫, এস.এ. খতিয়ান নং ৮৯, আর.এস. খতিয়ান নং ১২০, নামজারি খতিয়ান নং ১৪৫, আর.এস. দাগ নং ৩২১, জমির শ্রেণি নাল, মোট হস্তান্তরিত জমির পরিমাণ ৫.০০ শতক। জমির আনুমানিক দৈর্ঘ্য ১০০ ফুট এবং প্রস্থ ২২ ফুট; চূড়ান্ত পরিমাপ সংশ্লিষ্ট আমিন বা কর্তৃপক্ষের মাপ অনুযায়ী গণ্য হইবে।
+
+চৌহদ্দি: উত্তরে মোঃ সালামের জমি, দক্ষিণে ১২ ফুট প্রশস্ত সরকারি চলাচলের রাস্তা, পূর্বে মোঃ রহিমের বসতভিটা এবং পশ্চিমে একটি পুকুর ও পুকুরের পাড়। জমিতে প্রবেশের জন্য দক্ষিণ দিকের রাস্তা ব্যবহার করা যাইবে। রাস্তার ব্যবহার কোনো পক্ষ অযথা বন্ধ করিবেন না এবং পানি নিষ্কাশন বা চলাচলের স্বাভাবিক ব্যবস্থা নষ্ট করা হইবে না।
+
+কর, ফি ও খরচ: দলিল লেখার খরচ, রেজিস্ট্রেশন ফি, স্ট্যাম্প, স্থানীয় কর, নামজারি ফি এবং অন্যান্য সরকারি ব্যয় প্রচলিত নিয়ম অনুযায়ী সংশ্লিষ্ট পক্ষসমূহ বহন করিবেন। পূর্ববর্তী সময়ের ভূমি উন্নয়ন কর বা কোনো বকেয়া থাকিলে তাহা বিক্রেতা রেজিস্ট্রির তারিখ পর্যন্ত পরিশোধ করিবেন। রেজিস্ট্রির পরবর্তী কর, নামজারি এবং ব্যবহার সংক্রান্ত ব্যয় ক্রেতা বহন করিবেন।
+
+অত্র দলিলের বিষয়বস্তু উভয় পক্ষকে পাঠ করিয়া শুনানো হইলে তাহারা সম্পূর্ণ বুঝিয়া, কোনো প্রকার জোর, ভয়ভীতি, প্রতারণা বা অবৈধ প্রভাব ব্যতীত স্বেচ্ছায় স্বাক্ষর করিলেন। উভয় পক্ষ ঘোষণা করিতেছেন যে, তাঁহারা সুস্থ মস্তিষ্কে উপস্থিত ছিলেন এবং দলিলের সকল শর্ত গ্রহণ করিয়াছেন। সাক্ষীগণ পক্ষদ্বয়ের পরিচয়, স্বাক্ষর এবং দলিল সম্পাদনের ঘটনা প্রত্যক্ষ করিলেন।
+
+সাক্ষী ১: মোঃ কামাল হোসেন, পিতা মোঃ মতিউর রহমান, গ্রাম আশুলিয়া, সাভার, ঢাকা।
+সাক্ষী ২: মোছাঃ সালমা বেগম, স্বামী মোঃ জয়নাল আবেদীন, গ্রাম বিরুলিয়া, সাভার, ঢাকা।
+দলিল লেখক: মোঃ হাফিজুর রহমান, লাইসেন্স নং: DEMO-২০২৪।
+তারিখ: ১৭ পৌষ ১৪৩১ বঙ্গাব্দ / ৩১ ডিসেম্বর ২০২৪ খ্রিস্টাব্দ।
+
+নোট: এটি Sutro-এর ৫০০+ শব্দের fictional demo sample; কোনো প্রকৃত, সরকারি বা আইনগত দলিল নয়।`},
+ gift:{title:'নমুনা ২: হেবা বা দানপত্র দলিল',finding:'AI review suggestion: দাতা-গ্রহীতার সম্পর্ক, স্বেচ্ছায় দান, গ্রহণ ও দখল হস্তান্তরের বক্তব্য যাচাই করুন।',text:`নমুনা ২: হেবা বা দানপত্র দলিল
+দলিল নং: ২৩০৮/২০২৩ | সাব-রেজিস্ট্রি অফিস: ধামরাই, ঢাকা
+
+দাতা: মোঃ আব্দুর রহমান, পিতা মৃত আলী আকবর।
+গ্রহীতা: মোছাঃ ফাতেমা আক্তার, পিতা মোঃ আব্দুর রহমান।
+
+আমি দাতা ঘোষণা করিতেছি যে, নিম্ন তফসিলে বর্ণিত স্থাবর সম্পত্তি আমার বৈধ মালিকানাধীন ও দখলভুক্ত। আমার কন্যার প্রতি স্নেহ ও পারিবারিক কল্যাণের উদ্দেশ্যে ৮.০০ শতক জমি কোনো আর্থিক প্রতিদান ব্যতীত স্বেচ্ছায় হেবা করিলাম। গ্রহীতা হেবা গ্রহণ করিয়াছেন এবং দাতা দখল বুঝাইয়া দিয়াছেন।
+
+সম্পত্তির তফসিল: জেলা ঢাকা, উপজেলা ধামরাই, মৌজা কুশুরা, জে.এল. নং ৩২, আর.এস. খতিয়ান নং ১৯০, নামজারি খতিয়ান নং ২১৫, দাগ নং ৪৫৬, জমির শ্রেণি ভিটি, পরিমাণ ৮.০০ শতক।
+চৌহদ্দি: উত্তরে গ্রামের রাস্তা, দক্ষিণে মোঃ হাসানের বাড়ি, পূর্বে কৃষিজমি এবং পশ্চিমে মোঃ আলমের জমি।
+
+নোট: এটি Sutro demo sample; কোনো প্রকৃত বা আইনগত দলিল নয়।`},
+ partition:{title:'নমুনা ৩: বণ্টননামা দলিল',finding:'AI review suggestion: সকল পক্ষের অংশের যোগফল মোট জমির সমান কি না এবং যৌথ পথের শর্ত যাচাই করুন।',text:`নমুনা ৩: বণ্টননামা দলিল
+দলিল নং: ৩৪৫৬/২০২৫ | সাব-রেজিস্ট্রি অফিস: সাভার, ঢাকা
+
+প্রথম পক্ষ: মোঃ রফিকুল ইসলাম। দ্বিতীয় পক্ষ: মোঃ শফিকুল ইসলাম। তৃতীয় পক্ষ: মোছাঃ নাসরিন আক্তার।
+
+আমাদের পিতা মৃত মোঃ আব্দুল মালেক সাভারের বিরুলিয়া মৌজায় মোট ১৫.০০ শতক জমির মালিক ছিলেন। উত্তরাধিকার সূত্রে আমরা তিনজন প্রত্যেকে ৫.০০ শতক করিয়া অংশীদার হইয়াছি। পৃথক মালিকানা ও সীমানা নির্ধারণের উদ্দেশ্যে পারস্পরিক সম্মতিতে বণ্টন করা হইল।
+
+প্রথম পক্ষ দাগ নং ৭৮৯-এর উত্তরাংশে ৫.০০ শতক, দ্বিতীয় পক্ষ মধ্যাংশে ৫.০০ শতক এবং তৃতীয় পক্ষ দক্ষিণাংশে ৫.০০ শতক গ্রহণ করিবেন। পূর্ব পাশের ৬ ফুট পথ তিন পক্ষের যৌথ চলাচলের জন্য সংরক্ষিত থাকিবে।
+
+তফসিল: জেলা ঢাকা, উপজেলা সাভার, মৌজা বিরুলিয়া, জে.এল. নং ১৮, আর.এস. খতিয়ান নং ৩০২, দাগ নং ৭৮৯, জমির শ্রেণি ভিটি, মোট ১৫.০০ শতক।
+
+নোট: এটি Sutro demo sample; কোনো প্রকৃত বা আইনগত দলিল নয়।`},
+ history:{title:'নমুনা ৪: মালিকানার ইতিহাসসহ বিক্রয় দলিল',finding:'AI review suggestion: পূর্ববর্তী দলিল নম্বর, তারিখ, মালিকানার ধারাবাহিকতা ও অবশিষ্ট জমি যাচাই করুন।',text:`নমুনা ৪: মালিকানার ইতিহাসসহ বিক্রয় দলিল
+দলিল নং: ৪৭৮৯/২০২২ | সাব-রেজিস্ট্রি অফিস: গাজীপুর সদর
+
+বিক্রেতা: মোঃ জাহাঙ্গীর আলম। ক্রেতা: মোঃ সাইফুল ইসলাম।
+
+প্রাথমিক রেকর্ডীয় মালিক ছিলেন মৃত মোঃ ইসমাইল হোসেন; তাহার নামে এস.এ. খতিয়ান নং ৫৬-তে জমি রেকর্ডভুক্ত ছিল। উত্তরাধিকার ও পরবর্তী ২০১০ সালের ২৮৭৬ নং এবং ২০১৭ সালের ৫৬৭৮ নং রেজিস্ট্রিকৃত দলিলের মাধ্যমে মালিকানা হস্তান্তরের পর বিক্রেতা ১০.০০ শতকের মালিক হন।
+
+বর্তমানে তিনি উক্ত জমির মধ্য হইতে ৬.০০ শতক ১৮,০০,০০০/- টাকায় বিক্রয় করিলেন। অবশিষ্ট ৪.০০ শতক বিক্রেতার মালিকানায় থাকিবে। ক্রেতার প্রবেশের জন্য পূর্ব পাশের রাস্তা ব্যবহারের ব্যবস্থা থাকিবে।
+
+তফসিল: জেলা গাজীপুর, উপজেলা গাজীপুর সদর, মৌজা ভাওয়াল, জে.এল. নং ৪২, এস.এ. খতিয়ান নং ৫৬, আর.এস. খতিয়ান নং ২৭৮, দাগ নং ৬৫৪, মোট ১০.০০ শতক; বিক্রিত ৬.০০ শতক; অবশিষ্ট ৪.০০ শতক।
+
+নোট: এটি Sutro demo sample; কোনো প্রকৃত বা আইনগত দলিল নয়।`},
+ agreement:{title:'নমুনা ৫: বায়নানামা বা বিক্রয়চুক্তি',finding:'AI review suggestion: বায়নার টাকা, অবশিষ্ট মূল্য, সময়সীমা এবং final registration না হওয়া পর্যন্ত ownership transfer হয়নি—এগুলো যাচাই করুন।',text:`নমুনা ৫: বায়নানামা বা বিক্রয়চুক্তি
+চুক্তি নং: ৫১২০/২০২৫ | স্থান: কেরানীগঞ্জ, ঢাকা
+
+প্রথম পক্ষ বিক্রেতা: মোঃ নুরুল ইসলাম। দ্বিতীয় পক্ষ ক্রেতা: মোঃ আরিফ হোসেন।
+
+বিক্রেতা শুভাঢ্যা মৌজায় ৭.৫০ শতক জমির বৈধ মালিক। উভয় পক্ষের সম্মতিতে মোট বিক্রয়মূল্য ২২,৫০,০০০/- টাকা নির্ধারিত হইল। ক্রেতা বায়না বাবদ ৫,০০,০০০/- টাকা প্রদান করিলেন এবং অবশিষ্ট ১৭,৫০,০০০/- টাকা চূড়ান্ত সাফ-কবলা দলিল রেজিস্ট্রির সময় প্রদান করিবেন।
+
+চুক্তির তারিখ হইতে ৯০ দিনের মধ্যে কাগজপত্র যাচাই, পরিমাপ ও আইনানুগ প্রক্রিয়া সম্পন্ন করা হইবে। এই বায়নানামা দ্বারা চূড়ান্ত মালিকানা হস্তান্তর করা হইল না।
+
+তফসিল: জেলা ঢাকা, উপজেলা কেরানীগঞ্জ, মৌজা শুভাঢ্যা, জে.এল. নং ১২, আর.এস. খতিয়ান নং ৪৫৬, দাগ নং ৮৭৬, জমির শ্রেণি নাল, পরিমাণ ৭.৫০ শতক।
+
+নোট: এটি Sutro demo sample; কোনো প্রকৃত বা আইনগত দলিল নয়।`},
+ inconsistency:{title:'নমুনা ৬: অসংগতিসহ বিক্রয় দলিল',finding:'AI review warning: পূর্ববর্তী দলিলে ৬.০০ শতক, নামজারি খতিয়ানে ৫.৫০ শতক, কিন্তু বর্তমান বিক্রয় দলিলে ৬.০০ শতক লেখা আছে। রেকর্ড যাচাই ছাড়া অতিরিক্ত স্বত্ব ধরে নেওয়া যাবে না।',text:`নমুনা ৬: জমির পরিমাণ ও রেকর্ডের অসংগতিসহ বিক্রয় দলিল
+দলিল নং: ৬৭৮২/২০২৬ | সাব-রেজিস্ট্রি অফিস: সাভার, ঢাকা
+
+বিক্রেতা: মোঃ হাবিবুর রহমান। ক্রেতা: মোঃ তানজিম আহমেদ।
+
+বিক্রেতা ঘোষণা করিতেছেন যে, ২০১৯ সালের ২৫৬৭ নং দলিলমূলে তিনি জমিটি ক্রয় করেন। পূর্ববর্তী ক্রয় দলিলে জমির পরিমাণ ৬.০০ শতক উল্লেখ রহিয়াছে। পরবর্তীতে নামজারি খতিয়ান নং ৭৮৯ সৃজিত হইলে সেখানে জমির পরিমাণ ৫.৫০ শতক হিসাবে অন্তর্ভুক্ত হয়।
+
+বর্তমানে উভয় পক্ষ ৬.০০ শতক জমির মূল্য ১৫,০০,০০০/- টাকা নির্ধারণ করিয়াছেন। তবে পূর্ববর্তী দলিল, নামজারি খতিয়ান ও বাস্তব পরিমাপের মধ্যে অসংগতি থাকায় সংশ্লিষ্ট ভূমি অফিসের রেকর্ড ও অনুমোদিত জরিপের মাধ্যমে বিষয়টি যাচাই করা প্রয়োজন। অতিরিক্ত জমির স্বত্ব যাচাই ব্যতীত প্রতিষ্ঠিত হইবে না।
+
+তফসিল: জেলা ঢাকা, উপজেলা সাভার, মৌজা আশুলিয়া, জে.এল. নং ২৫, আর.এস. খতিয়ান নং ৩৪৫, নামজারি খতিয়ান নং ৭৮৯, দাগ নং ৫৬৭, শ্রেণি নাল।
+পূর্ববর্তী দলিল: ৬.০০ শতক। নামজারি খতিয়ান: ৫.৫০ শতক। বর্তমান দলিল: ৬.০০ শতক।
+
+নোট: এটি Sutro demo sample; এটি কোনো প্রকৃত বা আইনগত দলিল নয়।`}}
+function fillRewrite(data){
+ rewriteId=data.id;tab('rewrite');el('rewriteCard').hidden=false;el('rewriteFilename').textContent=data.filename;
+ el('rewritePageCount').textContent=`${data.page_count} পৃষ্ঠা`;el('rewriteOriginal').href=data.original_url;
+ el('rewriteText').value=sampleRewrites.sale.text;
+ el('rewriteResult').textContent='পরিষ্কার বাংলা demo data দেখানো হচ্ছে। Original PDF আলাদা করে সংরক্ষিত আছে।';
+ el('rewriteCard').scrollIntoView({behavior:'smooth',block:'start'});
+}
+el('rewriteUploadForm').addEventListener('submit',event=>{event.preventDefault();busy(event.target,async()=>{
+ el('rewriteUploadStatus').textContent='PDF পড়া ও OCR চলছে…';
+ try{fillRewrite(await api('/api/admin/deed-rewrites',{method:'POST',body:new FormData(event.target)}));message('PDF থেকে লেখা পাওয়া গেছে। এখন যাচাই ও সংশোধন করুন।')}finally{el('rewriteUploadStatus').textContent=''}
+})});
+if(el('useSampleRewrite'))el('useSampleRewrite').addEventListener('click',()=>{
+ if(el('rewriteText').value.trim()&&!confirm('বর্তমান লেখা বদলে নমুনা লেখা বসাবেন?'))return;
+ const select=el('sampleRewriteType');
+ const keys=Object.keys(sampleRewrites);
+ const key=select.value==='random'?keys[Math.floor(Math.random()*keys.length)]:select.value;
+ const sample=sampleRewrites[key];
+ select.value=key;
+ el('rewriteText').value=sample.text;
+ el('sampleRewriteFinding').textContent=`${sample.title} — ${sample.finding}`;
+ el('sampleRewriteFinding').hidden=false;
+ el('rewriteResult').textContent='ডেমো নমুনা লেখা বসানো হয়েছে। PDF তৈরির আগে প্রয়োজনমতো সম্পাদনা করুন।';
+});
+el('rewriteForm').addEventListener('submit',event=>{event.preventDefault();if(!event.target.reportValidity())return;busy(event.target,async()=>{
+ const data=await api('/api/admin/deed-rewrites/'+encodeURIComponent(rewriteId),{method:'PATCH',body:JSON.stringify({text:el('rewriteText').value})});
+ el('rewriteResult').innerHTML=`<strong>✓ বাংলা PDF তৈরি হয়েছে।</strong> <a target="_blank" rel="noopener" href="${esc(data.rewritten_url)}">ডাউনলোড করুন ↗</a>`;
+ message('পুনর্লিখিত বাংলা PDF তৈরি হয়েছে।');
 })});
 el('reviewForm').addEventListener('submit',event=>{event.preventDefault();const status=event.submitter?.value||'draft';if(status==='published'&&!event.target.reportValidity())return;busy(event.target,async()=>{
  const obj=Object.fromEntries(new FormData(event.target));obj.owners=parseRows(obj.owners,['name_bn','father_or_spouse_bn','share_exact']);obj.dag_rows=parseRows(obj.dag_rows,['dag_no','land_class_bn','area_dec']);

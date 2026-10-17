@@ -9,6 +9,8 @@ instance/*.pem
 instance/*.key
 instance/uploads/
 instance/complaints/
+instance/deed_rewrites/
+instance/tessdata/
 
 # Local tunnels and generated runtime artifacts
 ngrok.yml
