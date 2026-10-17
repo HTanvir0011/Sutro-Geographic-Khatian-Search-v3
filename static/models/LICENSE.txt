@@ -1,0 +1,9 @@
+Legacy experimental inference artifacts, retained and revalidated locally.
+
+Khatian printed-line model: MIT; trained on generated synthetic Sutro Form-5462 line crops. Original training run khatian-crnn-20261014-215159. Real scanned/handwritten form accuracy is not established.
+
+Numta digit model: CC BY-SA 4.0 derivative of NumtaDB by Bengali.AI, Saifullah Anik and contributors. Original training run numta-cnn-20261014-215200. Source: https://www.kaggle.com/datasets/BengaliAI/numta
+License: https://creativecommons.org/licenses/by-sa/4.0/
+Changes: grayscale 32x32 bilinear resized/inverted inputs; trained CNN and ONNX export. Isolated digits only; image-based split does not establish writer independence.
+
+Runtime packages carry their own MIT/OFL license notices. No real deed scans or training arrays are included here.

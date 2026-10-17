@@ -1,0 +1,16 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+data/*.lock
+data/*.tmp
+instance/*.sqlite3
+instance/*.pem
+instance/*.key
+instance/uploads/
+instance/complaints/
+
+# Local tunnels and generated runtime artifacts
+ngrok.yml
+*.log
+data/*.json

@@ -1,0 +1,1 @@
+(()=>{const language=document.getElementById('language');if(!language||document.querySelector('.admin-login'))return;const link=document.createElement('a');link.className='admin-login';link.href='/admin';link.textContent='Admin login';link.setAttribute('aria-label','Admin login');language.before(link)})();
